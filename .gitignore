@@ -14,8 +14,9 @@ Game_tg.json.tmp
 # Local test DBs
 *_test.json
 
-# Media / optional local assets
-map.jpg
+# Media (map image lives in maps/ and IS tracked)
+# Legacy root-level copy ignored:
+/map.jpg
 
 # OS / editor
 .DS_Store

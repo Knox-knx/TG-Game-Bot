@@ -1324,7 +1324,19 @@ Use: /travel <zone>
 """
 
     try:
-        with open("map.jpg", "rb") as photo:
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _candidates = [
+            os.path.join(_base, "maps", "map.jpg"),
+            os.path.join(_base, "map", "map.jpg"),
+            os.path.join(_base, "map.jpg"),
+            "maps/map.jpg",
+            "map/map.jpg",
+            "map.jpg",
+        ]
+        _found = next((p for p in _candidates if os.path.exists(p)), None)
+        if _found is None:
+            raise FileNotFoundError("map image not found")
+        with open(_found, "rb") as photo:
             bot.send_photo(msg.chat.id, photo, caption=caption)
     except:
         bot.send_message(msg.chat.id, caption + "\n\n⚠️ Map image not found")
