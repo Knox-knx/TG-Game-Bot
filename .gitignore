@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# Bot runtime data (per-chat state, regenerated)
+Game_tg.json
+Game_tg.json.tmp
+/tmp/
+
+# Local test DBs
+*_test.json
+
+# Media / optional local assets
+map.jpg
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

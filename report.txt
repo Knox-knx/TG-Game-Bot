@@ -1,0 +1,361 @@
+================================================================
+TG_GAME_BOT.py — COMPLETE LOGIC REPORT
+File: /home/komal/TG-Files/TG_GAME_BOT.py | Lines: 4260 | Compile: OK
+Generated: 2026-09-07 | Bot lib: pyTelegramBotAPI (telebot)
+================================================================
+
+1. EXECUTIVE SUMMARY
+----------------------------------------------------------------
+Single-file Telegram group RPG bot. Per-group isolated economy +
+combat + casino + jobs + gangs. State lives in RAM dicts, persisted
+to Game_tg.json via load()/save(). Starts with 3000 cash in "slums".
+
+Core loops:
+  mission (/mission 2m CD -> /do) -> cash + 30 XP
+  kill/rob/duel/arena -> PvP loot + jail/dead risk
+  casino (/casino /bet /color /coin /rps /slot /spin /mine) -> risk/reward
+  jobs -> passive cut of other players' spending via pay_job()
+  food/hunger -> survival tax on actions
+  gangs -> social, friendly-fire block
+  admin/owner -> moderation + broadcast
+
+Handlers: ~55 @bot.message_handler + 2 @bot.callback_query_handler
+Commands registered (56 incl. aliases):
+  startgame, helpgame, mission, do, map, travel, kill, rob, duel,
+  revive, arena, upgrade, protect, daily/reward, deposit, withdraw,
+  give, accept, decline, shop, food, eat, rps, slot, spin, coin,
+  color, casino, bet, fish, arrest, military, creategang, joingang,
+  ganginvite, acceptgang, panel, status, stat, top, mine, myjob,
+  alljob, joblist, setjob, removejob, owner, addadmin, removeadmin,
+  mygroups, admin, ban, unban, broadcast, broadcastpvt
+
+Callback prefixes handled in cb()/withdraw_cb():
+  wd_ (keypad), shop_weapons/breakers/armor/protect/main, protect_<sec>,
+  buy_<weapon|armor>, buybreaker_<w>, buyfood<item>, fight_<a>_<b>,
+  rpsbot_<uid>_<move>, slotspin_<uid>, travel_<owner>_<loc>,
+  minebet_<uid>_<amt>_<mult>, mineopen_<gid>_<pos>, minecash_<gid>,
+  top_<page>
+
+2. BOOT & CONFIG (lines 1-58)
+----------------------------------------------------------------
+ 1-8    imports: telebot, json, random, time, threading, os, html,
+        InlineKeyboardMarkup/Button. NOTE: `threading` imported but code
+        uses bare `Thread` (line 3477) -> NameError.
+ 10     TOKEN = os.environ.get("TOKEN") — no validation.
+ 11     ADMIN_IDS = env ADMIN_IDS comma-split, str-filtered.
+ 13     DATA_FILE = "Game_tg.json" (relative path).
+ 15     bot = telebot.TeleBot(TOKEN) — crashes if TOKEN is None.
+ 17-18  CONNECT_TIMEOUT=30, READ_TIMEOUT=30.
+ 21-48  RAM state: users, missions, trades, gangs, jail, dead, shield,
+        kill_cd, rob_cd, daily_cd, invites, mission_cd, banned, admin_cd,
+        job_owner, coin_cd, give_cd, group_data, duel_cd, pending_duels,
+        fish_cd, withdraw_input, rps_games, spin_cd, slot_games,
+        military_cd, rps_cd, slot_cd, mine_games + late-defined
+        casino_cd (3144), bet_cd (3237), color_cd (3304).
+        Duplicates: rps_games x2 (39,44), slot_games x2 (41,46),
+        spin_cd x2 (40,47) — harmless re-init.
+ 4242-4260 __main__: remove_webhook(), while True: infinity_polling(
+        timeout=60, long_polling_timeout=60, skip_pending=True) + 5s retry.
+        CRITICAL: load() is NEVER called at startup -> fresh RAM every
+        restart, disk data ignored.
+
+3. PERSISTENCE: load() / save() / ensure_chat() (51-167)
+----------------------------------------------------------------
+ load() 51-112: creates file if missing, json.load, .get() defaults,
+        isinstance guards, print OK/FAIL. On exception resets only
+        users/missions/trades/gangs/jail/dead/shield/daily/kill/rob/
+        invites/mission/banned — LOSES job_owner/group_data.
+ save() 142-166: dumps 15 keys (users..group_data) non-atomically, no lock.
+        NOT saved (volatile, lost on restart): duel_cd, fish_cd, rps_games,
+        slot_games/ slot_cd, spin_cd, mine_games, military_cd, rps_cd,
+        coin_cd, give_cd, admin_cd, casino_cd/bet_cd/color_cd,
+        withdraw_input, pending_duels, jail? (jail IS saved).
+        No threading.Lock -> concurrent handler save() can corrupt JSON.
+ ensure_chat(chat_id) 117-138: setdefault per-chat dicts for 13 stores.
+        Called at top of most commands. Returns str(chat_id).
+
+4. USER MODEL: get_user() / use_hunger() / add_xp() (260-381)
+----------------------------------------------------------------
+ get_user(user, chat_id):
+   - ensures per-chat dicts, creates new profile if missing:
+     {name, money:3000, bank:0, xp:0, level:1, zone:"slums",
+      weapon:None, armor:False, gang:None, hunger:100, inventory:[],
+      last_hunger:now, stats:{strength:5,muscles:5,stamina:5,
+      experience:0,power:5}, duel:{wins:0,losses:0,total:0},
+      crime:{caught:0}}
+   - updates name every call, setdefault-migrates old accounts,
+     early-return if dead (skips hunger? actually returns u anyway).
+   - SIDE EFFECT: auto-creates victim accounts on kill/rob/duel.
+ use_hunger(data, amt=1): hunger=max(0,hunger-amt); False if 0.
+ add_xp(chat,uid,amt): xp+=amt; if xp>=level*100: xp=0, level+=1.
+   (overflow XP discarded, single level per call).
+ check_bankrupt(chat,uid) 1502-1527: if money+bank<=-100000 reset to
+   starter kit. Practically DEAD CODE (balances rarely negative).
+   Reset does NOT clear dead/jail/shield/bankruptcy trades.
+
+5. STATIC CONFIG TABLES
+----------------------------------------------------------------
+ WEAPONS 169-177: knife 800/0.6/0.1, pistol 2000/0.65/0.2,
+   ak47 5000/0.75/0.3, shotgun 8000/0.8/0.4, Kar98k 15000/0.85/0.6,
+   rpg 20000/1.0/0.7. rate=kill base, risk=jail chance.
+ ARMOR 180: price 3000, reduce 0.2 (kill base -0.2, rob -0.2).
+ BREAKER_WEAPONS 182-188: Katana 10000/0.3/0.2, Desert Eagle 25000/0.5/0.6,
+   AWM 35000/0.75/0.7, breaker 70000/0.85/0.85. Only "breaker" has
+   shield-break logic; others are stat-orphans in kill path.
+ ZONES 190-205 + LOCATIONS 207-220: 12 zones.
+   slums .2 (200-800), city .4 (500-1500), bank .6 (1000-3000),
+   military .85 (2500-6000), harbor .5 (800-2500), casino .7 (1500-5000),
+   arena .9 (3000-7000), food .1 (100-400), market .3 (400-1200),
+   police .2 (200-600), mountain .75 (2000-5500), garden .1 (50-300).
+   risk in /mission = fail probability inverted (see §7).
+ MINE_MULTIS 223-233: {1:20,2:15,3:12,5:10,10:4,20:3,30:2,50:1}
+   = multiplier -> safe tiles out of 30. 50x = 1 safe tile.
+ FOODS 236-243: bread 100/+10, burger 300/+25, pizza 600/+50,
+   shawarma 800/+60, biryani 1000/+80, feast 1300/+100.
+ JOB_INFO 245-256: 10 jobs: smith, armor, protect, bank, police,
+   military, harbor, casino, food, breaker.
+ RANKS: get_money_rank(total) 484-494: <10k Middle, <20k Upper,
+   <100k Rich, <500k King, else Emperor.
+   get_duel_rank(wins) 498-516: <5 Bronze, <15 Silver, <30 Gold,
+   <60 Platinum, <100 Master, <150 Elite, <250 Champion,
+   <400 Elite Champion, else Fighter.
+ SPIN_REWARDS 3510-3518: +100,+250,+500,-100,-250,Jackpot+1000,Nothing.
+ SLOT_SYMBOLS 3614: cherry, lemon, melon, bell, star, diamond.
+
+6. HELP / PANEL / STATUS / STAT / TOP
+----------------------------------------------------------------
+ /startgame|/helpgame 370-479: static HTML help, lists all commands.
+ /panel 2835-2936: wallet/bank/total, money+duel ranks, level/zone/weapon/
+   armor/gang/hunger, duel W/L/rate, crime flag, dead/shield/jail timers.
+ /status 2943-3031: lighter version + kill_cd/rob_cd countdowns.
+ /stat 4032-4090: duel rank/table + power stats + hunger/money/bank.
+   Uses html.escape(name) — only place + /alljob that escapes.
+ /top: DUPLICATE handlers! top_cmd 3929-3940 (paginated, uses
+   build_top_page) + top 4216-4239 (plain top-10). Telebot fires BOTH
+   -> double reply on /top. build_top_page 3896-3926: sorts by
+   money+bank desc, 10/page, inline ⬅/➡ with top_<page>. Callback
+   top_<page> handled in cb() 2376-2405 with clamping.
+ /upgrade 3943-3969: /upgrade <stat>; cost=(stat+1)*500; no cap; allows
+   upgrading 'experience' (breaks progression) and 'power'.
+
+7. MISSIONS (/mission /do) (1707-1774)
+----------------------------------------------------------------
+ /mission 1708-1741: dead-gated, 120s per-user CD (mission_cd),
+   reward=rand(ZONES[zone].reward), risk=ZONES[zone].risk, store
+   missions[chat][uid], save. Message shows reward+rate.
+ /do 1744-1774: *** CRASH *** line 1748 use_hunger(u,3) before u defined
+   (u defined line 1760) -> NameError 100%. Intended: 30% loss of reward
+   on fail (money-=reward*0.3), success money+=reward +30 XP. Deletes
+   mission, save. Hunger -3 intended.
+
+8. COMBAT: /kill /rob /duel+fight /arrest /revive (2423-2831)
+----------------------------------------------------------------
+ /kill 2424-2535: reply-required, bot/self/dead-target/gangmate blocks,
+   600s kill_cd, shield check (breaker 60% break else blocked; expired
+   shields deleted), atk/tgt via get_user, base 0.6 +weapon(rate+0.1
+   capped 1.0) -armor0.2 -0.1 if hunger<30 clamped [0.1,1.0].
+   Success: loot=min(1500,tgt.money), dead[chat][tgt]=True.
+   risk=jail: 0.15+weapon.risk -> jail[chat][uid]=now +crime.caught+=1.
+   hunger-3, save. BUG: WEAPONS[atk.weapon] KeyError for breaker weapons
+   except "breaker" (Katana/Deagle/AWM not in WEAPONS).
+ /rob 2613-2717: *** CRASH *** line 2622 use_hunger(u,2) before u defined
+   -> NameError 100%. Intended: reply-required, 120s rob_cd + 120s jail
+   block, dead/shield/gang/broke checks, breaker 50% shield-break,
+   success=0.7+0.1 weapon-0.2 armor+0.05 levelAdv clamped [0.2,0.9],
+   loot=rand(100,min(1000,tgt.money)) (all if <100), fail->jail+crime.
+ /duel 3973-4030: reply-required, 60s duel_cd (set at REQUEST), dead/
+   gang blocks, posts stats + Fight button fight_<challenger>_<target>.
+   fight_ handler (in cb(), ~2000-2069): only target may click, dead
+   check, power=str+mus+pow+rand0-10 each, higher wins, reward 1000-3000
+   minted to winner +5 XP (loser +2), duel W/L/total++, hunger-3 both,
+   set duel_cd both=now, edit message with winner. No wager — inflation.
+ /arrest 2721-2772: police-job only (job_owner[chat].police==caller),
+   target must have crime.caught>=5, jail[target]=now, fine 2000 (or zero),
+   pay_job(police,fine) — minted even if victim broke. save.
+ /revive 2794-2831: must be dead, cost 1000 (deduct), dead.pop, hunger=100,
+   shield=now+300 (5min). Message confirms.
+ is_dead(chat,uid) 2538-2542, check_dead_block(msg,uid,action,silent)
+   2545-2565: banned->block; action in [withdraw,revive,status] bypasses
+   dead (but callers rarely pass action, so dead blocked everywhere
+   except /withdraw which skips check entirely and /accept which only
+   checks banned). See error-rep for auth matrix.
+
+9. ECONOMY: /daily /deposit /withdraw /give /accept /decline (1019-1285)
+----------------------------------------------------------------
+ /daily|/reward 1453-1492: 24h CD (daily_cd), +3000 money. Per-chat CD.
+ /deposit 1019-1088: /deposit <amt>, min 100, 1% fee (min 1), money-=amt,
+   bank+=amt-fee, pay_job(bank,fee) minted to banker. Verbose prints.
+ /withdraw 1359-1442: keypad UI number_pad("wd") (1-9,0,clear,ok, max 9
+   digits). withdraw_input[uid] string buffer (global, NOT per-chat,
+   NOT persisted). withdraw_cb 1383-1442: clear/ok/digit, validates
+   bank>=amt, bank-=amt money+=amt, edit message. NO dead check
+   (intentional per comment) -> dead can drain bank.
+ /give 1098-1168: reply-required, amt 1..1M, self/bot/balance checks,
+   5s give_cd, trades[chat][sender]={to,amount} with pending guards
+   (one per sender, one per receiver). NO expiry set.
+ /accept 1171-1244: banned-only gate (dead allowed), finds incoming trade
+   to caller, checks "expires" (never set), validates users/balances,
+   dead-sender cancels, money transfer, check_bankrupt both, delete trade.
+ /decline 1250-1285: dead-gated, finds incoming, deletes, shows sender.
+   Expired trades auto-purged (dead code — no expiry).
+
+10. TRAVEL & MAP (/map /travel) (1289-1335 + cb 2203-2231)
+----------------------------------------------------------------
+ /map 1289-1311: *** CRASH *** CONNECTIONS undefined (line 1295) ->
+   NameError 100%. Intended: show current zone + neighbors + map.jpg
+   (missing file falls back to text + warning).
+ /travel 1314-1335: posts 12 buttons travel_<uid>_<loc>, claims 20000
+   flight cost. Handler cb travel_ 2203-2231: owner-only click, same-zone
+   guard, balance check, money-=20000, zone=loc, edit message. No
+   CONNECTIONS enforcement — can jump anywhere if rich.
+
+11. SHOP (/shop + callbacks) (1777-1994)
+----------------------------------------------------------------
+ /shop 1778-1792: categories Weapons/Breakers/Armor/Protect.
+ cb() shop menus 1824-1863: edit message with item buttons.
+ protect_ 1869-1900: 300s/2000, 600s/4000, 900s/6000; already-protected
+   guard, deduct, pay_job(protect,price) minted, shield=now+dur.
+ buybreaker_ 1906-1923: price check, deduct, pay_job(breaker,price) minted,
+   weapon=item (overwrites).
+ buy_ 1929-1961: armor (3000, pay_job armor, armor=True) or WEAPONS
+   (deduct, pay_job smith, weapon=item).
+ buyfood 1966-1994: inventory cap 20, deduct, pay_job(food,price) minted,
+   inventory.append. Callback buyfood<item> (no underscore).
+ /food 625-643: inline list FOODS with buyfood buttons.
+ /eat 650-679: /eat <item>, must own, hunger=min(100,hunger+heal),
+   inventory.remove. No dead? Has dead check.
+ /protect 2573-2603: dead-gated, shows same 3 protect buttons.
+ Generic cb() 1794+: single func=lambda c:True catches ALL non-wd_
+   callbacks; dead-blocks buy_/buybreaker_/protect_/fight_/rpsbot_/
+   slotspin_ if dead. Withdraw callbacks early-return (handled by
+   withdraw_cb registered first). Missing "ignore" answer -> spinner hang.
+
+12. CASINO (7 games + jobs) (3136-3890)
+----------------------------------------------------------------
+ ALL require zone=="casino" (except /mine — no zone gate!) + dead gate.
+ /casino 3147-3233: /casino <amt≤50k>, 3s casino_cd, win_chance .45
+   +.05 weapon -.05 armor -.10 hunger<30 clamped [.2,.7]. Win: money+=amt
+   (profit = bet, stake never taken); Lose: money-=amt. pay_job(casino,amt)
+   ALWAYS minted to owner. hunger-2. check_bankrupt.
+ /bet 3239-3298: /bet <1-10> <amt≤30k>, 3s bet_cd. Hit: money+=amt*4
+   (stake not taken); Miss: money-=amt. pay_job(casino,amt) minted.
+ /color 3306-3374: /color <red|black|green> <amt≤50k>, 3s color_cd.
+   P(red).45/black.45/green.10. Win red/black 2x (money+=amt*2? stake kept?
+   code money+=win where win=amt*2 -> profit 2x), green 5x. Lose money-=amt.
+   pay_job minted.
+ /coin 3724-3820: /coin <heads|tails> <amt≤50k>, 60s coin_cd. Win money+=amt,
+   lose money-=amt. pay_job minted.
+ /rps 3378-3503: /rps <amt≤100k> solo or reply-PvP. 60s rps_cd, one-game
+   guard. PvP: both money-=amt locked, pot 2x, rps_games[key]={p1,p2,amt,
+   choices,time}, buttons rps_<a>_<b>_<move>, expire thread refunds after
+   30s. *** TWO BUGS ***: (a) Thread NameError (need threading.Thread) ->
+   crash AFTER locking money; (b) NO handler for rps_<..> PvP clicks in
+   cb() -> buttons dead, funds stuck. Bot mode: money-=amt, buttons
+   rpsbot_<uid>_<move>, rps_games[chat_uid_bot], handler rpsbot_ 2075-2133:
+   30s timeout refund, draw refund, win money+=amt*2, lose nothing (stake
+   sunk), pay_job(casino,amt) minted. Message says Win 1.8x but pays 2x.
+ /slot 3616-3713: /slot <bet≤100k>, 60s slot_cd, one-game guard, money-=bet
+   locked, slot_games[key]={bet,time}, 6-button grid slotspin_<uid>.
+   Handler slotspin_ 2138-2198: owner-only, 30s refund, 3 random symbols:
+   triple bet*5, pair bet*2, else 0. pay_job(casino,bet//5) minted.
+ /spin 3520-3609: /spin <amt≤100k>, 60s spin_cd, money-=amt locked,
+   random SPIN_REWARDS value v, money+=v. NET = v-amt (bet mostly sunk;
+   max +1000 vs bet up to 100k -> negative EV by design, but message
+   shows Result:v hiding net loss). pay_job(casino,v//5) only if v>0.
+ /mine 4094-4130 + cb minebet/mineopen/minecash 2236-2371: /mine <amt>
+   (NO dead/zone/CD/balance-cap checks beyond money>=amt), pick mult
+   1/2/3/5/10/20/30/50 -> minebet_<uid>_<amt>_<mult>: deduct amt,
+   safe=sample(30,MINE_MULTIS[mult]), mine_games[gid]={owner,bet,multi,
+   safe,opened,won:amt}, 30 ❓ buttons mineopen_<gid>_<pos> + Collect
+   minecash_<gid>. mineopen: safe->won*=multi (exponential! 50x^n),
+   bomb->delete game, "lost everything". minecash: money+=won, delete.
+   *** BUG *** minecash game_id parse split("_")[1] drops suffix
+   (gid "chat_uid" -> "chat") -> never found -> winnings UNCLAIMABLE.
+   No casino cut, no hunger, no cooldown.
+
+13. WORK: /fish /military (3827-3888, 526-589)
+----------------------------------------------------------------
+ /fish 3827-3888: zone harbor, 30s fish_cd, hunger<10 block, success .8
+   (-.2 if hunger<30). Fail: hunger-5. Win: reward 300-1200, tax 30%,
+   user+=reward-tax, pay_job(harbor,tax) minted. BUG: success path never
+   reduces hunger (message claims -5).
+ /military 526-589: zone military + must OWN military job
+   (job_owner[chat].military==uid), 60s military_cd, 90% success:
+   fail money-=50-150; win money+=300-1500 + pay_job(military,reward//4)
+   (self-minted if owner==self).
+
+14. JOBS (/setjob /removejob /myjob /joblist /alljob) (1532-1700)
+----------------------------------------------------------------
+ Valid: smith armor protect bank police military harbor casino food breaker.
+ /setjob 1532-1582: admin-only (is_admin), reply + jobname, get_user(target)
+   pre-register, overwrite job_owner[chat][job]=target. Reassign message.
+ /removejob 1662-1680: admin-only, delete key.
+ /myjob 1684-1700: list jobs owned by caller.
+ /joblist 1636-1657: assigned jobs -> names (Unknown if unregistered).
+ /alljob 596-620: all 10 jobs with owner name or Available + JOB_INFO.
+ pay_job(chat,job,amt) 1588-1633: validates amt>0, lower-strips job,
+   owner lookup, NO auto-create (skips if unregistered), money+=int(amt)
+   MINTED (not transferred). Verbose debug prints. Called by: deposit(bank
+   fee), shop(smith/armor/protect/breaker/food), casino(all games),
+   fish(harbor tax), arrest(police fine), military(self-cut).
+
+15. GANGS (/creategang /joingang /ganginvite /acceptgang) (3036-3134)
+----------------------------------------------------------------
+ /creategang 3038-3061: /creategang <name>, dead-gated, name collision
+   check, gangs[chat][name]=[uid], u.gang=name. No cost/validation.
+ /joingang 3063-3085: joins existing, appends (duplicates allowed), sets gang.
+ /ganginvite 3088-3110: inviter must have gang, invites[chat][tgt]=gang.
+   No membership/permission check beyond having a gang.
+ /acceptgang 3112-3133: consumes invite, gangs.setdefault.append, sets gang.
+   No leavegang command. Kill/rob/duel all block same-gang attacks.
+
+16. ADMIN & MODERATION (/owner /addadmin /removeadmin /admin /ban
+    /unban /broadcast /broadcastpvt /mygroups) (686-1015)
+----------------------------------------------------------------
+ See error-rep.txt §LOGIN for full auth matrix. Summary:
+ /owner 787-817 (claim): group-only, caller must be Telegram chat admin
+   (get_chat_administrators), sets group_data[chat]={owner:uid,admins:[]}.
+   Re-claim only by same owner, silent fails otherwise.
+ is_admin(uid,chat) 686-695: uid==owner or in admins. False if unclaimed.
+ /addadmin 701-721 /removeadmin 727-751: owner-only, reply-target, silent
+   guards, owner cannot be removed.
+ /admin 824-850: 2s admin_cd, is_admin gate, prints help.
+ /ban 855-896 /unban 899-926: 2s admin_cd, is_admin, reply-required,
+   owner immune (silent), self-ban blocked, banned[chat][tgt]=True/pop.
+ /broadcast 930-966: BOT-OWNER only (ADMIN_IDS env), /broadcast <msg> to
+   every chat in users.keys() with HTML parse, 0.05s pacing, success count.
+ /broadcastpvt 969-1015: BOT-OWNER only, DM every unique user_id across
+   chats, 0.03s pacing, sent/failed counts, dup-set.
+ /mygroups 756-780: private-only, lists group titles owned via get_chat().
+ Cooldowns: admin_cd global keyed by user (cross-chat leak).
+
+17. MISC COOLDOWNS & ECONOMY TABLE
+----------------------------------------------------------------
+ daily 24h | mission 120s | kill 600s | rob 120s (+120s jail) | give 5s |
+ duel 60s | rps 60s (+30s game) | slot 60s (+30s game) | spin 60s |
+ coin 60s | casino 3s | bet 3s | color 3s | fish 30s | military 60s |
+ admin 2s | protect 300/600/900s durations.
+ All in-memory except daily/kill/rob/mission (persisted). Restart clears
+ the rest -> exploit window.
+
+18. KNOWN DUPLICATE / DEAD CODE
+----------------------------------------------------------------
+ - Duplicate /top handlers (3929 + 4216) -> double reply.
+ - Duplicate globals (rps_games, slot_games, spin_cd).
+ - pending_duels (36) never used; duel uses duel_cd + inline buttons.
+ - last_hunger set never read; hunger only via use_hunger/manual.
+ - mission_cd persisted but casino/bet/color/coin/rps/slot/spin/fish/
+   military/duel/give/admin CDs not.
+ - check_bankrupt threshold unreachable; trades.expires never set.
+ - HTML escaping missing except /stat + /alljob.
+ - Debug prints in deposit/pay_job (1021-1083, 1589-1633) spam stdout.
+
+19. FILE & DEPLOY NOTES
+----------------------------------------------------------------
+ Needs: map.jpg (optional), Game_tg.json (auto-created), env TOKEN,
+ optional ADMIN_IDS. No requirements.txt, no webhook, polling only.
+ Data file relative -> must run from correct cwd. No locking/backups.
+ See readme.md for setup and error-rep.txt for all defects with fixes.
+================================================================
+END OF REPORT
+================================================================

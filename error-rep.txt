@@ -1,0 +1,323 @@
+================================================================
+TG_GAME_BOT.py — ERROR REPORT + LOGIN/AUTH AUDIT
+File: /home/komal/TG-Files/TG_GAME_BOT.py (4260 lines, py_compile OK)
+Generated: 2026-09-07
+Severity: P0=crash/data-loss  P1=money-lock/exploit  P2=major-logic
+          P3=minor/UX  SEC=security/auth
+================================================================
+
+────────────────────────────────────────────────────────────────
+PART A — LOGIN / AUTH / PERMISSION AUDIT  ("check all login")
+────────────────────────────────────────────────────────────────
+
+[A1] BOT TOKEN — lines 10, 15  [P0 + SEC]
+  TOKEN = os.environ.get("TOKEN")  ->  bot = telebot.TeleBot(TOKEN)
+  - No None/empty validation. Missing env => TeleBot(None) raises at
+    import/startup, whole bot down, confusing traceback.
+  - Token in env only (good, not hardcoded), but no rotation/revoke docs.
+  FIX: assert TOKEN, "Set TOKEN env"; exit(1) with clear message.
+
+[A2] BOT-OWNER (global) — lines 11, 938-939, 978-979  [SEC/P2]
+  ADMIN_IDS = [str(x) for x in os.getenv("ADMIN_IDS","").split(",") if x]
+  Gates ONLY /broadcast + /broadcastpvt.
+  - Empty env => [] => broadcasts unusable by anyone (fail-closed, good).
+  - Whitespace IDs (" 123 ") never stripped => mismatch => legit owner
+    locked out. IDs compared as str (good).
+  - No /broadcast rate-limit beyond 2s CD; global spam possible.
+  FIX: [x.strip() for x ... if x.strip()]; log configured owners at boot.
+
+[A3] GROUP OWNER CLAIM (/owner) — lines 787-817  [SEC/P2]
+  Group-only. Verifies caller in bot.get_chat_administrators(chat).
+  Sets group_data[chat]={owner:uid, admins:[]}. Re-claim only by same owner.
+  - Silent returns (no message) on: private chat, non-TG-admin, чужой claim
+    => confusing UX but SAFE (no info leak). Good.
+  - Overwrites admins=[] on re-claim by same owner => wipes admin list.
+  - get_chat_administrators failure => silent abort (bot not admin?).
+  - group_data persisted (save/load include it) — good.
+  FIX: notify owner when admins wiped; message on private-chat misuse.
+
+[A4] is_admin() — lines 686-695  [SEC]
+  return uid==group_data[chat].owner or uid in admins; False if unclaimed.
+  Used by: /admin, /ban, /unban, /setjob, /removejob, /addadmin(owner-only),
+  /removeadmin(owner-only).
+  - Correct fail-closed when group never claimed.
+  - No Telegram-admin fallback: TG admins that never /owner have no power.
+  - No caching; pure dict lookup (fine).
+  STATUS: logic CORRECT, keep.
+
+[A5] ADD/REMOVE ADMIN — lines 701-751  [SEC/P3]
+  Owner-only (group_data[chat].owner==uid), reply-target, owner immune from
+  removal (744-745). Silent on unclaimed chat / non-owner.
+  - /addadmin idempotent (append-if-missing, good); /removeadmin safe.
+  - No self-add guard needed; noexpiry.
+  STATUS: OK. Minor: silent fails confuse; add feedback.
+
+[A6] BAN SYSTEM — lines 855-926, gate 2545-2551  [SEC/P2]
+  /ban: admin-only + 2s admin_cd + reply + owner-immune(silent) +
+  self-ban blocked + dup check. banned[chat][tgt]=True.
+  /unban: pops key. Both persisted.
+  Enforcement: check_dead_block() blocks banned on ~28 commands; /accept
+  checks banned only (1177) so dead can still receive money (intentional).
+  GAPS:
+  - /withdraw has NO check at all => banned+dead can drain bank. Inconsistent.
+  - Callbacks (shop/fight/rps/slot) check dead but NOT banned => banned user
+    can still buy/fight via buttons.
+  - check_dead_block(msg,uid,action) whitelist ["withdraw","revive","status"]
+    is NEVER passed by callers => dead blocked even on whitelisted cmds
+    except /withdraw (skips check) and /accept (custom check).
+  FIX: centralize: every handler + every callback branch calls
+  check_dead_block; pass action="withdraw|revive|status" where allowed.
+
+[A7] DEAD GATE — lines 2538-2565  [P2]
+  is_dead()=uid in dead[chat]. check_dead_block = banned?block :
+  action-whitelist?pass : dead?block+hint.
+  Allowed-when-dead TODAY: /withdraw (no check), /accept (banned-only),
+  everything else blocked. Hint says "Only /revive /withdraw /status" but
+  /status does NOT pass action whitelist and HAS no exemption => dead
+  calling /status gets blocked despite hint. Contradiction.
+  FIX: make hint match code; pass action explicitly.
+
+[A8] JOB GATING — lines 1532-1582 (/setjob admin-only), 2737 police check,
+  543-551 military-owner check  [SEC/P3]
+  - /setjob correctly admin-only + pre-registers target via get_user (good,
+    else pay_job would skip unregistered owner).
+  - /arrest requires job_owner[chat].police==caller (good); /military
+    requires zone+ownership (good). No other job has an action gate —
+    smith/armor/bank/harbor/casino/food/breaker/protect are PASSIVE earners.
+  - Any admin can reassign any job (overwrite, notified). No confirmation.
+  STATUS: OK by design; consider confirm on reassign.
+
+[A9] RPS/SLOT/TRAVEL/MINE button ownership — lines 2008, 2144, 2207, 2240,
+  2311, 2354, 2076-2091  [SEC/P3]
+  travel_/slotspin_/minebet_/mineopen_ verify clicker==owner (good).
+  fight_ verifies clicker==target (good — only challenged can accept).
+  rpsbot_ has NO clicker check: key includes uid but anyone can click
+  rpsbot_<victim>_<move> and spend victim's locked bet. Exploit.
+  FIX: if str(call.from_user.id)!=uid: reject.
+
+[A10] AUTH SUMMARY TABLE
+  TOKEN (env) ........... bot process identity ........ P0 if missing
+  ADMIN_IDS (env) ....... /broadcast,/broadcastpvt ... fail-closed OK
+  TG chat admin ......... /owner claim prerequisite ... OK
+  group_data.owner ..... /addadmin,/removeadmin ..... OK (silent)
+  is_admin .............. /admin,/ban,/unban,/setjob,/removejob OK
+  job_owner.police ...... /arrest ................... OK
+  job_owner.military .... /military ................. OK
+  banned ................ check_dead_block .......... PARTIAL (see A6)
+  dead .................. check_dead_block .......... PARTIAL (see A7)
+  button owner .......... travel/slot/mine/fight .... OK except rpsbot_
+
+────────────────────────────────────────────────────────────────
+PART B — DEFECTS (ordered by severity)
+────────────────────────────────────────────────────────────────
+
+———— P0 — GUARANTEED CRASH / DATA LOSS ————
+
+[P0-1] load() NEVER CALLED — lines 4242-4260 (__main__)
+  def load() exists (51) but __main__ goes straight to polling. Every
+  restart starts with empty RAM; Game_tg.json never read. All users/jobs/
+  bans "lost" until overwritten by next save().
+  FIX: call load() first line of __main__.
+
+[P0-2] /do NameError 100% — line 1748
+  use_hunger(u,3) executes BEFORE u=get_user(...) (line 1760).
+  Every /do raises NameError: name 'u' is not defined. Missions uncompletable.
+  FIX: move use_hunger AFTER u defined (and after mission-exists check).
+
+[P0-3] /rob NameError 100% — line 2622
+  use_hunger(u,2) BEFORE atk=get_user (line 2662). Every /rob crashes.
+  FIX: delete line 2622 or move after atk defined: use_hunger(atk,2).
+
+[P0-4] /arena NameError 100% — lines 4140-4141
+  use_hunger(winner,3)/use_hunger(loser,3) reference undefined names;
+  u defined line 4147. Every /arena crashes.
+  FIX: delete lines 4140-4141 (hunger already drained line 4207).
+
+[P0-5] /map NameError 100% — line 1295
+  CONNECTIONS never defined anywhere (only LOCATIONS+ZONES exist).
+  paths=CONNECTIONS.get(current,[]) raises NameError on every /map.
+  FIX: define e.g. CONNECTIONS={z: [other zones]} or use LOCATIONS.
+
+[P0-6] RPS-PvP Thread NameError — line 3477
+  `import threading` (5) but code calls bare Thread(...). PvP branch crashes
+  AFTER deducting both players' money (3445-3446) => funds stuck in
+  rps_games with no refund thread.
+  FIX: from threading import Thread OR threading.Thread(...).
+
+[P0-7] TOKEN=None boot crash — lines 10,15 (see A1).
+  FIX: validate env at startup.
+
+———— P1 — MONEY LOCKED / INFLATION / EXPLOIT ————
+
+[P1-1] RPS-PvP buttons DEAD — /rps 3434-3477 creates callbacks
+  rps_<p1>_<p2>_<move> but cb() (1794+) has NO `startswith("rps_")` branch
+  (only rpsbot_). Clicks fall through silently; money stays locked. Only
+  (broken, P0-6) expire thread could refund.
+  FIX: implement PvP choice handler (store choices{}, resolve when both
+  picked, pay pot 2x minus rake, refund on timeout).
+
+[P1-2] /mine cash-out UNCLAIMABLE — line 2347
+  game_id="chat_uid" (line 2257, contains _). minecash_ callback is
+  f"minecash_{game_id}" => "minecash_123_456". Handler does
+  split("_")[1] => "123" only => never in mine_games => winnings frozen.
+  (mineopen_ correctly rebuilds f"{parts[1]}_{parts[2]}".)
+  FIX: game_id=call.data.split("minecash_")[1] (same for minebet parsing).
+
+[P1-3] pay_job() MINTS money — lines 1588-1633
+  user["money"]+=int(amount) from thin air on EVERY: deposit fee, shop
+  (full price), casino (full bet even on player loss), fish tax, arrest
+  fine (even if victim broke), military self-cut. Job owners inflate supply
+  without bound. Casino owner gets paid even when house should collect.
+  FIX: decide sink vs transfer; at minimum pay fraction, cap, or transfer
+  from actual pot/loss instead of minting full bet.
+
+[P1-4] /spin EV broken — lines 3571-3580
+  money-=amt then money+=value where value in {-250..+1000} independent of
+  amt. Betting 100k can win max +1000 => guaranteed ~-99k. Message shows
+  "Result: value" hiding net (value-amt).
+  FIX: scale rewards by bet or show net clearly.
+
+[P1-5] Breaker weapons crash /kill — lines 2491-2494
+  w=WEAPONS[atk["weapon"]] KeyError for Katana/Desert Eagle/AWM (stored in
+  BREAKER_WEAPONS, not WEAPONS). Only lowercase "breaker" has shield logic
+  (2475, 2670). Buying a 10-35k breaker then /kill crashes handler.
+  FIX: lookup={**WEAPONS,**BREAKER_WEAPONS}; extend shield-break to all
+  breakers or document.
+
+[P1-6] Duplicate /top handlers — lines 3929 (top_cmd) + 4216 (top)
+  Both register commands=['top'] => telebot fires BOTH => double reply,
+  double build. Different formats (paginated vs plain) confuse users.
+  FIX: keep one; rename other to /top10 or remove.
+
+[P1-7] No save locking + non-atomic write — lines 142-166
+  Concurrent telebot worker threads can interleave json.dump => truncated
+  Game_tg.json => next load() exception => PARTIAL reset (P1-8). No backup.
+  FIX: threading.Lock around load/save + atomic write (tmp+os.replace).
+
+[P1-8] load() failure drops job_owner/group_data — lines 105-112
+  Exception path resets users/missions/trades/gangs/jail/dead/shield/
+  daily/kill/rob/invites/mission/banned but NOT job_owner/group_data
+  (left as whatever half-loaded state). Ownership/moderation lost.
+  FIX: reset ALL globals identically; keep .bak copy.
+
+[P1-9] /mine no gates + exponential win — lines 4094-4130, 2319-2322
+  No dead/zone/CD check (unlike every other casino game); won*=multi per
+  safe tile => 50x chained => astronomical mint (bet*50^n). No casino rake,
+  no hunger, mult not validated against MINE_MULTIS (KeyError on tamper but
+  also no bet cap).
+  FIX: add zone/casino gate + CD + max tiles/cap + validate mult + rake.
+
+———— P2 — MAJOR LOGIC BUGS ————
+
+[P2-1] /give trades NEVER EXPIRE — lines 1148-1168 vs 1193,1268
+  Code checks t["expires"] but never SETS it => pending transfer blocks
+  sender ("already pending") + receiver ("already pending") FOREVER until
+  /accept//decline. Griefing vector.
+  FIX: trades[chat][sender]={..., "expires": now+300}; sweep on give/accept.
+
+[P2-2] RPS payout mismatch — line 3491 vs 2108
+  Prompt says Win 1.8x, code pays amt*2. Either overpays or misleads.
+  FIX: align text and math.
+
+[P2-3] /fish success never drains hunger — lines 3862-3888
+  Fail path hunger-=5; success path only adds money, message still claims
+  "Hunger: -5". Infinite fishing at full hunger.
+  FIX: u["hunger"]=max(0,hunger-5) on success too.
+
+[P2-4] check_bankrupt unreachable + incomplete — lines 1502-1527
+  Triggers at total<=-100000 but-flow clamps (loot capped, balance checks)
+  so never fires. If it did, reset keeps dead/jail/shield => still
+  dead/jailed after "reset".
+  FIX: lower threshold or drop; clear dead/jail/shield/trades on reset.
+
+[P2-5] Cooldowns mostly volatile — §17 of report.txt
+  Only daily/kill/rob/mission persisted; duel/rps/slot/spin/coin/casino/
+  bet/color/fish/military/give/admin wiped on restart => double-claim window.
+  FIX: persist all CDs or accept + document.
+
+[P2-6] withdraw_input global, not per-chat, not persisted — lines 38,1366
+  Keyed by uid only => same user in 2 groups shares keypad buffer (cross-talk).
+  FIX: key f"{chat}_{uid}".
+
+[P2-7] gang joins duplicate + no leave — lines 3079, 3125
+  append without membership check => same uid N times; no /leavegang;
+  invite needs only "has gang" (no leader check).
+  FIX: if uid in list: reject; add /leavegang.
+
+[P2-8] Callback "ignore" unanswered + wd_ double-handler — lines 1383,1794,
+  1800, 3922
+  top pagination middle button data="ignore" has no branch => client spinner
+  hangs. wd_ seen by BOTH handlers (withdraw_cb + cb); cb early-returns
+  without answer_callback_query => if handler order changes, spinner hangs.
+  FIX: answer every callback path; add `if data=="ignore": answer()`.
+
+[P2-9] /upgrade can upgrade 'experience' — lines 3956-3965
+  stat in u["stats"] includes experience/power with same linear cost
+  (stat+1)*500, no cap => pay-to-inflate XP, unbounded duel power
+  (strength+muscles+power uncapped).
+  FIX: allowlist ["strength","muscles","stamina","power"]; cap e.g. 100.
+
+[P2-10] Jail only enforced on /rob — lines 2652 vs /kill
+  jail[chat][uid] set by kill+rob but only rob checks it (2652). Jailed
+  player can still /kill, /duel, casino, etc.
+  FIX: gate kill/duel/casino on jail or document jail=rob-only.
+
+[P2-11] get_user auto-creates victims — lines 2468, 2662-2663, 4001
+  Attacking a never-seen user creates a 3000-cash account mid-attack,
+  enabling forced onboarding + loot from fresh wallet.
+  FIX: reject if target not in users[chat] ("target hasn't joined").
+
+[P2-12] HTML injection — panel/status/top/kill/duel embed u['name']
+  unescaped (only /stat+alljob escape). Name with <b>/<code> breaks parse_mode
+  or spoofs output; send fails => handler exception.
+  FIX: html.escape(name) everywhere.
+
+———— P3 — MINOR / UX / HYGIENE ————
+
+[P3-1] Duplicate globals rps_games/slot_games/spin_cd (39-47). Harmless.
+[P3-2] Debug prints deposit (1021-1083) + pay_job (1589-1633) spam logs,
+  leak internal balances/owner IDs to stdout.
+[P3-3] add_xp overflow discarded (1374-1379): xp=0 not xp-=need; multi-level
+  in one gain impossible. Minor.
+[P3-4] /owner re-claim wipes admins (811-814). Confirm first.
+[P3-5] admin_cd keyed by user globally (833,864,908) => /admin in group A
+  rate-limits /ban in group B. Key (chat,uid).
+[P3-6] number_pad max 9 digits but no min-withdrawal; "0" rejected only at ok.
+[P3-7] /travel ignores CONNECTIONS (even after fix) — any zone for 20k.
+  Enforce adjacency or remove map paths.
+[P3-8] kill base 0.6 comment "upgraded" but WEAPONS table says 0.6-1.0;
+  Kar98k inconsistent capitalisation ("Kar98k" vs lower). Cosmetic.
+[P3-9] buyfood callback "buyfood<item>" (no _) vs "buy_<item>" — fragile
+  replace("buyfood","",1); breaks if food named with prefix. Use buyfood_<x>.
+[P3-10] slot UI 6 buttons all same callback slotspin_<uid>; fine but no
+  distinct choice — misleading grid.
+[P3-11] broadcast sends raw text with parse_mode HTML — < in message raises;
+  wrap in try per-chat (already) but whole-batch count misleading.
+[P3-12] military self-pay (582): owner pays self reward//4 minted — document
+  or remove.
+[P3-13] arrest zeroes victim then still mints full fine to police (2759-2765).
+  Pay min(fine, seized) instead.
+[P3-14] duel reward minted 1000-3000 with no stake (2032-2034) — inflation;
+  consider wager or smaller reward.
+[P3-15] status hint vs code mismatch (see A7).
+[P3-16] Missing requirements.txt, no logging setup, relative DATA_FILE/map.jpg
+  break when cwd differs. Use absolute paths via __file__.
+
+────────────────────────────────────────────────────────────────
+PART C — FIX CHECKLIST (copy-paste order)
+────────────────────────────────────────────────────────────────
+1. Startup: validate TOKEN; call load(); strip ADMIN_IDS; lock saves.
+2. Crash: move use_hunger after get_user (/do,/rob) / delete in /arena;
+   define CONNECTIONS; Thread->threading.Thread; guard breaker lookup.
+3. Money: implement rps_ PvP handler; fix minecash_ parse; cap /mine;
+   fix /spin EV text; make pay_job transfer-or-fraction, not full mint.
+4. Auth: gate callbacks on banned; pass action whitelist; check rpsbot_
+   clicker; escape all names; persist CDs or document.
+5. UX: merge duplicate /top; set trade expiry; fix fish hunger; add
+   /leavegang; answer "ignore"; remove debug prints.
+6. Retest: /do, /rob, /arena, /map, RPS-PvP full cycle, mine bet->open->
+   cashout, kill with each breaker, restart persistence, ban/dead matrix.
+
+================================================================
+END OF ERROR REPORT
+================================================================
